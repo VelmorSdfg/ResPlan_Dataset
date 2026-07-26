@@ -147,7 +147,7 @@ from resplan_dataset import ResPlanSegmentation, class_weights
 import torch.nn as nn
 
 train_ds = ResPlanSegmentation("masks_out", split="train")   # с аугментациями
-val_ds   = ResPlanSegmentation("masks_out", split="val")     # без аугментаций
+val_ds   = ResPlanSegmentation("masks_out", split="val")     # чистая валидация
 
 train_dl = DataLoader(train_ds, batch_size=8, shuffle=True, num_workers=4)
 
@@ -155,8 +155,25 @@ train_dl = DataLoader(train_ds, batch_size=8, shuffle=True, num_workers=4)
 # mask : int64   [B,H,W],   значения = ID классов, готово для CrossEntropy/Dice
 ```
 
-Параметры: `root`, `split` (`train`/`val`), `transform`, `in_channels` (3 или 1),
-`size` (ресайз), `ids` (явный список файлов — для k-fold).
+Параметры: `root`, `split` (`train`/`val`), `variant`, `transform`,
+`pre_transform`, `deterministic`, `in_channels` (3 или 1), `size` (ресайз),
+`ids` (явный список файлов — для k-fold).
+
+### Три набора аугментаций (`variant`)
+
+| variant | список | геометрия | фотометрия/деградация | детерминизм |
+|---|---|---|---|---|
+| `train` | train.txt | affine, elastic/grid, **perspective** | полный + JPEG/blur/морфология/dropout | нет |
+| `val` | val.txt | нет | нет | (не нужен) |
+| `val_heavy` | val.txt | perspective (верх. граница) | усиленная деградация | **да** |
+
+```python
+# стресс-валидация на UGC-устойчивость (та же выборка, что val)
+heavy_ds = ResPlanSegmentation("masks_out", split="val", variant="val_heavy")
+```
+
+`val_heavy` **детерминирован**: сид выводится из имени файла, поэтому метрика
+устойчивости воспроизводима, а не пляшет от вызова к вызову.
 
 ### Что здесь важно
 
@@ -172,11 +189,22 @@ train_dl = DataLoader(train_ds, batch_size=8, shuffle=True, num_workers=4)
 * Вход реплицируется в 3 канала под предобученный энкодер — отсюда
   трёхканальная статистика ImageNet. `in_channels=1` тоже поддержан, но тогда
   из рецепта выпадает `ISONoise` (он определён только для RGB).
+* `Morphological` в Albumentations — **DualTransform**: по умолчанию эрозия/
+  дилатация применяется и к маске, сдвигая границы классов. Поэтому он обёрнут
+  в `ImageOnlyMorphological` (применение к маске = тождество). `CoarseDropout`
+  по той же причине идёт с `fill_mask=None`.
+* Кастомные `random_blots` (кляксы) и `synthetic_clutter` (числа-подписи и
+  размерные стрелки) рисуются вручную через cv2 **до** Albumentations, только
+  на изображении. `synthetic_clutter` получает маску и не рисует поверх стен,
+  чтобы не подделывать структуру.
 
 Набор аугментаций train (`build_train_transform`): affine `scale 0.9–1.1`,
 `rotate ±15°`, translate (`p=0.7`); `OneOf(elastic, grid distortion)` (`p=0.2`);
-brightness/contrast (`p=0.5`); CLAHE (`p=0.2`); `OneOf(gaussian, ISO noise)`
-(`p=0.3`). Валидация (`build_val_transform`) — без геометрии и фотометрии.
+`perspective` (`p=0.3`); brightness/contrast (`p=0.5`); CLAHE (`p=0.2`);
+`OneOf(gaussian, ISO noise)` (`p=0.3`); деградация качества — `ImageCompression`,
+`OneOf(motion blur, defocus)`, морфология, `CoarseDropout`. Плюс кастомные
+кляксы и подписи. Валидация (`build_val_transform`) — без геометрии и
+фотометрии.
 
 ### Веса классов
 
@@ -192,7 +220,10 @@ criterion = nn.CrossEntropyLoss(weight=w)
 `1/частота` (агрессивнее). Масштаб дисбаланса виден сразу: `stair` получает
 вес 38.3 и `storage` 25.2 против `living` 0.22.
 
-![Аугментированные пары](assets/aug_pairs.png)
+Исходник → train-аугментация → val_heavy (маска следует геометрии, фотометрия
+её не трогает):
+
+![Сетка аугментаций](assets/aug_grid.png)
 
 ---
 
