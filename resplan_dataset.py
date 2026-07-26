@@ -38,6 +38,7 @@ import torch
 from torch.utils.data import Dataset
 
 import albumentations as A
+from albumentations.core.transforms_interface import ImageOnlyTransform, DualTransform
 from albumentations.pytorch import ToTensorV2
 
 # Статистика ImageNet: чертёж серый, но его реплицируют в 3 канала под
@@ -48,6 +49,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 PAPER_VALUE = 255  # чем заполнять углы входа при геометрии
 BACKGROUND_ID = 0  # чем заполнять углы маски
 WALL_ID = 8        # класс стен; synthetic_clutter не рисует поверх него
+OPENING_IDS = (9, 10, 11)  # window, door, front_door — их NonUniformStroke не заклеивает
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +61,97 @@ class ImageOnlyMorphological(A.Morphological):
     применяется И к маске, сдвигая границы классов и ломая попиксельное
     соответствие пары. Нам нужен эффект утолщения/утончения ТОЛЬКО линий на
     изображении, поэтому применение к маске переопределяем на тождество."""
+
+    def apply_to_mask(self, mask, *args, **params):
+        return mask
+
+
+def _match_channels(result: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """cv2.erode/dilate роняют одиночную ось канала — восстанавливаем её,
+    чтобы форма (H,W,1) не превратилась в (H,W)."""
+    if result.ndim < ref.ndim:
+        result = result[..., None]
+    return result
+
+
+class RandomLineBreaks(ImageOnlyTransform):
+    """Разрывы в линиях: локальное утоньшение по случайным пятнам — имитация
+    сухого пера / выцветшего скана. Внутри пятна берётся утоньшённая версия
+    (max-фильтр расширяет белый лист), поэтому эффект ТОЛЬКО убирает чернила:
+    фантомную стену создать не может и проём не заклеивает. Image-only, стены
+    определяются прямо по чернилам входа (mask не нужен)."""
+
+    def __init__(self, num_breaks=(3, 8), patch_size=(6, 16),
+                 kernel: int = 3, p: float = 0.15):
+        super().__init__(p=p)
+        self.num_breaks = num_breaks
+        self.patch_size = patch_size
+        self.kernel = kernel
+
+    def get_params_dependent_on_data(self, params, data):
+        h, w = data["image"].shape[:2]
+        rg = self.random_generator
+        n = int(rg.integers(self.num_breaks[0], self.num_breaks[1] + 1))
+        spots = [(int(rg.integers(0, w)), int(rg.integers(0, h)),
+                  int(rg.integers(self.patch_size[0], self.patch_size[1] + 1)))
+                 for _ in range(n)]
+        return {"spots": spots}
+
+    def apply(self, img, spots=(), **params):
+        k = np.ones((self.kernel, self.kernel), np.uint8)
+        thinned = _match_channels(cv2.dilate(img, k), img)  # max -> линии тоньше/рвутся
+        field = np.zeros(img.shape[:2], np.uint8)
+        for cx, cy, r in spots:
+            cv2.circle(field, (cx, cy), r, 1, -1)
+        m = field.astype(bool)
+        out = img.copy()
+        out[m] = thinned[m]
+        return out
+
+
+class NonUniformStroke(DualTransform):
+    """Неоднородная толщина линий: низкочастотное поле, где в одних зонах
+    чернила чуть жирнее (дилатация), в других тоньше (эрозия) — естественный
+    разброс веса пера вместо глобального сдвига. Дилатация ЗАПРЕЩЕНА в зоне
+    проёмов (door/window/front_door по маске), иначе стена затянула бы дверь и
+    вход разошёлся бы с меткой. Утоньшение безопасно везде. Маску не меняет
+    (apply_to_mask = тождество); mask нужен только для защиты проёмов, оттого
+    DualTransform."""
+
+    def __init__(self, kernel: int = 3, cell: int = 32, p: float = 0.15):
+        super().__init__(p=p)
+        self.kernel = kernel
+        self.cell = cell
+
+    def get_params_dependent_on_data(self, params, data):
+        h, w = data["image"].shape[:2]
+        rg = self.random_generator
+        # низкочастотное поле: мелкий шум, апскейл до размера кадра
+        gh, gw = max(2, h // self.cell), max(2, w // self.cell)
+        low = rg.standard_normal((gh, gw)).astype(np.float32)
+        field = cv2.resize(low, (w, h), interpolation=cv2.INTER_LINEAR)
+        dilate_zone = field > 0.4
+        erode_zone = field < -0.4
+        # защита проёмов от дилатации
+        protect = np.zeros((h, w), bool)
+        mask = data.get("mask")
+        if mask is not None:
+            opening = np.isin(mask, OPENING_IDS).astype(np.uint8)
+            if opening.any():
+                ksz = self.kernel * 2 + 1
+                protect = cv2.dilate(opening, np.ones((ksz, ksz), np.uint8)).astype(bool)
+        return {"dilate_zone": dilate_zone & ~protect, "erode_zone": erode_zone}
+
+    def apply(self, img, dilate_zone=None, erode_zone=None, **params):
+        k = np.ones((self.kernel, self.kernel), np.uint8)
+        thicker = _match_channels(cv2.erode(img, k), img)   # min -> чернила растут
+        thinner = _match_channels(cv2.dilate(img, k), img)  # max -> чернила тоньше
+        out = img.copy()
+        if dilate_zone is not None:
+            out[dilate_zone] = thicker[dilate_zone]
+        if erode_zone is not None:
+            out[erode_zone] = thinner[erode_zone]
+        return out
 
     def apply_to_mask(self, mask, *args, **params):
         return mask
@@ -292,6 +385,9 @@ def _degradation_block(heavy: bool = False) -> List[A.BasicTransform]:
                      A.Defocus(radius=(2, 5))], p=0.6),
             ImageOnlyMorphological(scale=(1, 3), operation="dilation", p=0.3),
             ImageOnlyMorphological(scale=(1, 2), operation="erosion", p=0.3),
+            # неоднородная толщина + рваные линии (image-only, безопасны к маске)
+            NonUniformStroke(kernel=3, cell=32, p=0.4),
+            RandomLineBreaks(num_breaks=(4, 10), patch_size=(6, 18), p=0.35),
             A.CoarseDropout(num_holes_range=(3, 7),
                             hole_height_range=(15, 40),
                             hole_width_range=(15, 40),
@@ -304,6 +400,10 @@ def _degradation_block(heavy: bool = False) -> List[A.BasicTransform]:
         # расплывшиеся / истончённые линии (image-only подкласс)
         ImageOnlyMorphological(scale=(1, 3), operation="dilation", p=0.15),
         ImageOnlyMorphological(scale=(1, 2), operation="erosion", p=0.15),
+        # неоднородный вес линии (дилатация не заклеивает проёмы) + локальные
+        # разрывы линий; обе image-only и маску не меняют
+        NonUniformStroke(kernel=3, cell=32, p=0.15),
+        RandomLineBreaks(num_breaks=(3, 8), patch_size=(6, 16), p=0.15),
         # потёртости/пятна: fill_mask=None -> маска не трогается
         A.CoarseDropout(num_holes_range=(2, 5),
                         hole_height_range=(10, 30),

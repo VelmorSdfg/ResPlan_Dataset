@@ -202,9 +202,24 @@ heavy_ds = ResPlanSegmentation("masks_out", split="val", variant="val_heavy")
 `rotate ±15°`, translate (`p=0.7`); `OneOf(elastic, grid distortion)` (`p=0.2`);
 `perspective` (`p=0.3`); brightness/contrast (`p=0.5`); CLAHE (`p=0.2`);
 `OneOf(gaussian, ISO noise)` (`p=0.3`); деградация качества — `ImageCompression`,
-`OneOf(motion blur, defocus)`, морфология, `CoarseDropout`. Плюс кастомные
-кляксы и подписи. Валидация (`build_val_transform`) — без геометрии и
-фотометрии.
+`OneOf(motion blur, defocus)`, морфология, `NonUniformStroke`,
+`RandomLineBreaks`, `CoarseDropout`. Плюс кастомные кляксы и подписи. Валидация
+(`build_val_transform`) — без геометрии и фотометрии.
+
+Две морфологические аугментации специально для чертежей (обе image-only,
+маску не меняют):
+
+* `RandomLineBreaks` — локальные разрывы/утоньшение линий (сухое перо,
+  выцветший скан). Строго **только убирает чернила** — фантомную стену
+  создать не может, проверено: 0 новых чернил на выборке.
+* `NonUniformStroke` — неоднородная толщина линий низкочастотным полем.
+  Дилатация **запрещена в зоне door/window/front_door** (по маске), иначе
+  стена затянула бы проём; проверено: 0 новых чернил внутри проёмов. IoU
+  между чернилами и классом `wall` при этом намеренно падает (утолщённая
+  стена выходит за границу класса) — это ожидаемый эффект, маска остаётся
+  корректной.
+
+![Морфологические эффекты](assets/morph_effects.png)
 
 ### Веса классов
 
