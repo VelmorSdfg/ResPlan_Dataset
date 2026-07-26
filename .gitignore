@@ -9,9 +9,10 @@ ResPlan.pkl
 masks_out/*
 !masks_out/class_mapping.json
 !masks_out/pixel_frequency.json
-
-# Сплиты не коммитим: они детерминированно восстанавливаются из --seed.
-# (train.txt / val.txt попадают под masks_out/* выше.)
+# Сплиты коммитим явно: полагаться на воспроизводимость по --seed мало,
+# зафиксированный список гарантирует, что train/val те же самые.
+!masks_out/train.txt
+!masks_out/val.txt
 
 # ── Python ────────────────────────────────────────────────────────────
 __pycache__/

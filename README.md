@@ -137,6 +137,95 @@ python resplan_to_masks.py --limit 20 --images --color
 
 ---
 
+## Обучение: PyTorch Dataset
+
+`resplan_dataset.py` отдаёт готовые пары для сегментации.
+
+```python
+from torch.utils.data import DataLoader
+from resplan_dataset import ResPlanSegmentation, class_weights
+import torch.nn as nn
+
+train_ds = ResPlanSegmentation("masks_out", split="train")   # с аугментациями
+val_ds   = ResPlanSegmentation("masks_out", split="val")     # без аугментаций
+
+train_dl = DataLoader(train_ds, batch_size=8, shuffle=True, num_workers=4)
+
+# image: float32 [B,3,H,W], нормализован статистикой ImageNet
+# mask : int64   [B,H,W],   значения = ID классов, готово для CrossEntropy/Dice
+```
+
+Параметры: `root`, `split` (`train`/`val`), `transform`, `in_channels` (3 или 1),
+`size` (ресайз), `ids` (явный список файлов — для k-fold).
+
+### Что здесь важно
+
+* Аугментации применяются **синхронно** к паре одним вызовом
+  `transform(image=..., mask=...)` — иначе вход и метка разъезжаются.
+* Маска **никогда** не нормализуется и интерполируется только
+  `INTER_NEAREST`: её значения это ID классов, билинейка смешала бы 3 и 5 в
+  несуществующий 4.
+* При поворотах пустые углы заполняются осмысленно: лист (255) для входа и фон
+  (0) для маски. Дефолтный `BORDER_REFLECT_101` отзеркалил бы куски стен и
+  создал бы геометрию, которой на плане нет.
+* Фотометрия идёт до `Normalize`, т.к. `CLAHE` и `ISONoise` требуют `uint8`.
+* Вход реплицируется в 3 канала под предобученный энкодер — отсюда
+  трёхканальная статистика ImageNet. `in_channels=1` тоже поддержан, но тогда
+  из рецепта выпадает `ISONoise` (он определён только для RGB).
+
+Набор аугментаций train (`build_train_transform`): affine `scale 0.9–1.1`,
+`rotate ±15°`, translate (`p=0.7`); `OneOf(elastic, grid distortion)` (`p=0.2`);
+brightness/contrast (`p=0.5`); CLAHE (`p=0.2`); `OneOf(gaussian, ISO noise)`
+(`p=0.3`). Валидация (`build_val_transform`) — без геометрии и фотометрии.
+
+### Веса классов
+
+`class_weights()` читает `pixel_frequency.json` и отдаёт тензор для
+взвешенного лосса:
+
+```python
+w = class_weights("masks_out", scheme="median")   # или "inverse"
+criterion = nn.CrossEntropyLoss(weight=w)
+```
+
+`median` — median-frequency balancing (мягче, обычно устойчивее), `inverse` —
+`1/частота` (агрессивнее). Масштаб дисбаланса виден сразу: `stair` получает
+вес 38.3 и `storage` 25.2 против `living` 0.22.
+
+![Аугментированные пары](assets/aug_pairs.png)
+
+---
+
+## Проверки перед обучением
+
+```bash
+python audit_dataset.py --root masks_out
+```
+
+Целостность пар (сироты, рассинхрон размеров, наличие файлов из списков),
+утечка train/val, вырожденные примеры, покрытие холста. Возвращает ненулевой
+код выхода, если что-то найдено.
+
+```bash
+python sanity_check.py --samples 20 --epochs 80
+```
+
+Учит `smp.Unet(resnet34)` на 20 примерах до переобучения. Если модель не может
+запомнить два десятка картинок — где-то баг, и искать его надо до полного
+обучения.
+
+**Читать результат надо по классам, а не по общему mIoU.** На эталонном прогоне
+крупные классы дошли до **0.969** среднего IoU (`wall` 0.971 — он тонкий и
+первым бы обрушился при рассинхроне пары), а `storage`, `stair`, `door`,
+`front_door` остались около нуля. Это не баг, а дисбаланс ~200×: на 20 примерах
+без взвешенного лосса такие классы дешевле проигнорировать. Общий macro-mIoU
+из-за них упирается в ~0.72.
+
+![Кривые обучения](assets/overfit_curve.png)
+![Предсказания](assets/overfit_preds.png)
+
+---
+
 ## Особенности данных, которые влияют на обучение
 
 **Сильный дисбаланс классов.** `bedroom` + `living` — около трети пикселей,
