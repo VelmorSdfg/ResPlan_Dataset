@@ -70,6 +70,10 @@ def main():
     ap.add_argument("--encoder", default="resnet34")
     ap.add_argument("--assets", default="assets", help="куда класть кривые и предсказания")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--augment", action="store_true",
+                    help="обучать с ПОЛНЫМ набором train-аугментаций (геометрия, "
+                         "фотометрия, деградация, морфология, клаттер); оценка всегда "
+                         "на чистой версии тех же примеров")
     args = ap.parse_args()
 
     import segmentation_models_pytorch as smp
@@ -83,11 +87,22 @@ def main():
     names = [id_to_name[i] for i in range(num_classes)]
 
     full = ResPlanSegmentation(args.root, split="train")
-    ds = ResPlanSegmentation(args.root, split="train",
-                             ids=full.files[:args.samples],
-                             transform=build_val_transform())  # без аугментаций
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    print(f"примеров: {len(ds)}  эпох: {args.epochs}  классов: {num_classes}")
+    ids = full.files[:args.samples]
+
+    # Оценка ВСЕГДА на чистой версии — иначе метрика мерит случайное искажение,
+    # а не то, что модель выучила. При --augment обучаем на аугментированных
+    # тех же примерах: если аугментация рассинхронит пару image/mask, градиенты
+    # станут противоречивыми и даже чистый IoU не вырастет — так ловится баг.
+    eval_ds = ResPlanSegmentation(args.root, split="train", variant="val", ids=ids)
+    if args.augment:
+        train_ds = ResPlanSegmentation(args.root, split="train",
+                                       variant="train", ids=ids)
+        print("режим: ПОЛНЫЕ train-аугментации (оценка на чистых)")
+    else:
+        train_ds = eval_ds
+        print("режим: без аугментаций (чистое переобучение)")
+    dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    print(f"примеров: {len(train_ds)}  эпох: {args.epochs}  классов: {num_classes}")
 
     try:
         model = smp.Unet(args.encoder, encoder_weights="imagenet",
@@ -108,7 +123,7 @@ def main():
         inter = np.zeros(num_classes); union = np.zeros(num_classes)
         present = np.zeros(num_classes, bool); per_sample = []
         with torch.no_grad():
-            for x, y in DataLoader(ds, batch_size=args.batch_size, num_workers=0):
+            for x, y in DataLoader(eval_ds, batch_size=args.batch_size, num_workers=0):
                 pred = model(x).argmax(1)
                 for i in range(pred.shape[0]):
                     p, g = pred[i], y[i]; ious = []
@@ -190,8 +205,8 @@ def main():
     rows = []
     model.eval()
     with torch.no_grad():
-        for i in range(min(3, len(ds))):
-            x, y = ds[i]
+        for i in range(min(3, len(eval_ds))):
+            x, y = eval_ds[i]
             pred = model(x.unsqueeze(0)).argmax(1)[0].numpy().astype(np.uint8)
             sep = np.full((x.shape[1], 4, 3), 160, np.uint8)
             rows.append(np.hstack([denormalize(x), sep,
