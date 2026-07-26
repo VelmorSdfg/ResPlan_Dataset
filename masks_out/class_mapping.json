@@ -1,0 +1,44 @@
+{
+  "class_id_from_source_key": {
+    "living": 1,
+    "bedroom": 2,
+    "bathroom": 3,
+    "kitchen": 4,
+    "balcony": 5,
+    "storage": 6,
+    "stair": 7,
+    "wall": 8,
+    "window": 9,
+    "door": 10,
+    "front_door": 11
+  },
+  "id_to_name": {
+    "0": "background",
+    "1": "living",
+    "2": "bedroom",
+    "3": "bathroom",
+    "4": "kitchen",
+    "5": "balcony",
+    "6": "storage",
+    "7": "stair",
+    "8": "wall",
+    "9": "window",
+    "10": "door",
+    "11": "front_door"
+  },
+  "draw_order": [
+    "living",
+    "bedroom",
+    "bathroom",
+    "kitchen",
+    "balcony",
+    "storage",
+    "stair",
+    "wall",
+    "window",
+    "door",
+    "front_door"
+  ],
+  "background_id": 0,
+  "resolution": 256
+}
