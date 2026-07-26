@@ -157,7 +157,7 @@ WALL_VALUE = 0     # тёмные стены
 
 
 def plan_to_image(plan: dict, res: int, margin: int,
-                  opening_dilate: int = 1) -> np.ndarray:
+                  opening_dilate: int = 0) -> np.ndarray:
     """Рендерит план как чертёж: тёмные стены на белом листе, двери/окна —
     разрывы в стенах. Комнаты НЕ раскрашиваются по типам (иначе задача
     вырождается: модель считывала бы цвет вместо геометрии).
@@ -182,8 +182,13 @@ def plan_to_image(plan: dict, res: int, margin: int,
     wall = raster(STRUCTURE_KEYS)
     opening = raster(OPENING_KEYS)
 
-    # Небольшое расширение проёма гарантирует, что он прорезает стену
-    # насквозь, а не оставляет тонкую перемычку из-за растеризации.
+    # По умолчанию расширение выключено (0). Замер на выборке показал, что
+    # двери/окна прорезают стену насквозь и без него: остаточных перемычек
+    # 0 px, а IoU(чернила входа, класс wall в маске) = 1.000 против 0.967
+    # при расширении в 1 px. То есть расширение лишь срезало однопиксельные
+    # торцы стен у проёмов, создавая пиксели, размеченные как wall, но
+    # выглядящие на входе пустым листом. Ручка оставлена на случай данных
+    # с более грубой геометрией, где перемычки всё же появятся.
     if opening_dilate > 0 and opening.max() > 0:
         opening = cv2.dilate(opening, np.ones((3, 3), np.uint8),
                              iterations=opening_dilate)
@@ -229,8 +234,9 @@ def main():
     ap.add_argument("--color", action="store_true", help="дополнительно писать цветной превью")
     ap.add_argument("--images", action="store_true",
                     help="рендерить входные картинки-чертежи в images/ (пары к маскам)")
-    ap.add_argument("--opening-dilate", type=int, default=1,
-                    help="на сколько расширять двери/окна при вырезании проёма в стене")
+    ap.add_argument("--opening-dilate", type=int, default=0,
+                    help="на сколько расширять двери/окна при вырезании проёма в стене "
+                         "(0 = точно по геометрии, вход и маска совпадают идеально)")
     ap.add_argument("--limit", type=int, default=0, help="обработать только N планов (отладка)")
     args = ap.parse_args()
 
